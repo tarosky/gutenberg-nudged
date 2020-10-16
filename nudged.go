@@ -158,7 +158,9 @@ func createInvalidator(socket, phpFile string) func() {
 		client, err := gofast.SimpleClientFactory(connFactory, 0)()
 		if err != nil {
 			log.Error("client", zap.Error(err))
+			return
 		}
+		defer client.Close()
 
 		resp, err := client.Do(&gofast.Request{
 			Role: gofast.RoleResponder,
@@ -185,6 +187,7 @@ func createInvalidator(socket, phpFile string) func() {
 		})
 		if err != nil {
 			log.Error("fastcgi failure", zap.Error(err))
+			return
 		}
 		resp.WriteTo(&ResWriter{}, os.Stderr)
 	}
