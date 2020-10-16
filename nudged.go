@@ -84,16 +84,9 @@ func main() {
 			cancel()
 		}()
 
-		connFactory := gofast.SimpleConnFactory("unix", c.Path("fastcgi-socket"))
-
-		client, err := gofast.SimpleClientFactory(connFactory, 0)()
-		if err != nil {
-			log.Error("client", zap.Error(err))
-		}
-
 		poll(
 			ctx,
-			createInvalidator(client, c.Path("invalidator-file")),
+			createInvalidator(c.Path("fastcgi-socket"), c.Path("invalidator-file")),
 			c.Path("nudge-file"),
 			c.Int("check-interval"))
 
@@ -141,7 +134,7 @@ func poll(ctx context.Context, invalidate func(), file string, interval int) {
 			case <-pacemaker.C:
 				st, err := os.Stat(file)
 				if err != nil {
-					log.Error("failed to stat file", zap.Error(err))
+					log.Warn("failed to stat file", zap.Error(err))
 					continue
 				}
 
@@ -158,8 +151,15 @@ func poll(ctx context.Context, invalidate func(), file string, interval int) {
 	}()
 }
 
-func createInvalidator(client gofast.Client, phpFile string) func() {
+func createInvalidator(socket, phpFile string) func() {
 	return func() {
+		connFactory := gofast.SimpleConnFactory("unix", socket)
+
+		client, err := gofast.SimpleClientFactory(connFactory, 0)()
+		if err != nil {
+			log.Error("client", zap.Error(err))
+		}
+
 		resp, err := client.Do(&gofast.Request{
 			Role: gofast.RoleResponder,
 			Params: map[string]string{
