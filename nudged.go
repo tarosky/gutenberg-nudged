@@ -73,7 +73,7 @@ func main() {
 		defer log.Sync()
 
 		if nudgeType := c.String("nudge-type"); nudgeType != "mtime" {
-			log.Fatal("illegal nudge-type parameter", zap.String("parameter", nudgeType))
+			log.Panic("illegal nudge-type parameter", zap.String("parameter", nudgeType))
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -103,7 +103,7 @@ func main() {
 
 	err := app.Run(os.Args)
 	if err != nil {
-		stdlog.Fatal("failed to run app", zap.Error(err))
+		stdlog.Panic("failed to run app", zap.Error(err))
 	}
 }
 
