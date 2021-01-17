@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/urfave/cli/v2"
@@ -78,8 +79,13 @@ func main() {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		sig := make(chan os.Signal)
-		signal.Notify(sig, os.Interrupt, os.Kill)
+		signal.Notify(sig, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGQUIT)
 		go func() {
+			defer func() {
+				signal.Stop(sig)
+				close(sig)
+			}()
+
 			<-sig
 			cancel()
 		}()
