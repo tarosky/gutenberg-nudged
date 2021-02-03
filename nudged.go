@@ -275,6 +275,28 @@ func (w *ResWriter) WriteHeader(statusCode int) {
 	log.Debug("php response", zap.Int("status code", statusCode))
 }
 
+func fileInfo(path string) os.FileInfo {
+	// Ignore NFS cache by opening file before stat().
+	f, err := os.Open(path)
+	if err != nil {
+		log.Error("failed to open nudge file", zap.Error(err))
+		return nil
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Error("failed to close nudge file", zap.Error(err))
+		}
+	}()
+
+	st, err := f.Stat()
+	if err != nil {
+		log.Error("failed to stat nudge file", zap.Error(err))
+		return nil
+	}
+
+	return st
+}
+
 func poll(ctx context.Context, invalidate func(), file string, interval int) {
 	go func() {
 		mtime := time.Time{}
@@ -288,9 +310,8 @@ func poll(ctx context.Context, invalidate func(), file string, interval int) {
 				break
 
 			case <-pacemaker.C:
-				st, err := os.Stat(file)
-				if err != nil {
-					log.Warn("failed to stat file", zap.Error(err))
+				st := fileInfo(file)
+				if st == nil {
 					continue
 				}
 
