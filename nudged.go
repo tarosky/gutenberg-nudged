@@ -24,6 +24,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const maxOutputLen = 20 * 1024
+
 var (
 	log *zap.Logger
 )
@@ -167,13 +169,22 @@ type DirSync struct {
 }
 
 func (s *DirSync) poll() *bool {
+	t := fileModTime(s.File)
 	additionT := fileModTime(s.WithAdditionFile)
+	defer func() {
+		if t != nil {
+			s.FileModTime = *t
+		}
+		if additionT != nil {
+			s.WithAdditionFileModTime = *additionT
+		}
+	}()
+
 	if additionT != nil && !additionT.Equal(s.WithAdditionFileModTime) {
 		b := true
 		return &b
 	}
 
-	t := fileModTime(s.File)
 	if t != nil && !t.Equal(s.FileModTime) {
 		b := false
 		return &b
@@ -213,15 +224,21 @@ func (n *DirsNotification) poll() ([]*DirSync, bool) {
 }
 
 type Notifications struct {
-	File        string            `json:"file"`
-	Dirs        *DirsNotification `json:"directories"`
-	FileModTime time.Time
+	File            string            `json:"file"`
+	Dirs            *DirsNotification `json:"directories"`
+	InvalidatorFile string            `json:"invalidator-file"`
+	FileModTime     time.Time
 }
 
 func (n *Notifications) poll() ([]*DirSync, bool) {
-	ds, addition := n.poll()
+	ds, addition := n.Dirs.poll()
 
 	t := fileModTime(n.File)
+	defer func() {
+		if t != nil {
+			n.FileModTime = *t
+		}
+	}()
 	if t != nil && !t.Equal(n.FileModTime) {
 		addition = true
 	}
@@ -261,6 +278,7 @@ func loadConfig(log *zap.Logger, path string) *config {
 		dirSync.WithAdditionFile = mustGetAbsPath(dirSync.WithAdditionFile)
 	}
 	cfg.Notifications.File = mustGetAbsPath(cfg.Notifications.File)
+	cfg.Notifications.InvalidatorFile = mustGetAbsPath(cfg.Notifications.InvalidatorFile)
 
 	return cfg
 }
@@ -282,12 +300,6 @@ func main() {
 			Aliases: []string{"i"},
 			Value:   1000,
 			Usage:   "Polling interval.",
-		},
-		&cli.PathFlag{
-			Name:     "invalidator-file",
-			Aliases:  []string{"p"},
-			Required: true,
-			Usage:    "PHP file to invalidate OPcache.",
 		},
 		&cli.PathFlag{
 			Name:     "fastcgi-socket",
@@ -347,7 +359,8 @@ func main() {
 		cfg := loadConfig(log, mustGetAbsPath("config-file"))
 
 		invalidator := createInvalidator(
-			mustGetAbsPath("fastcgi-socket"), mustGetAbsPath("invalidator-file"))
+			mustGetAbsPath("fastcgi-socket"), cfg.Notifications.InvalidatorFile)
+		// invalidator := createTestInvalidator()
 		poll(ctx, invalidator, cfg, c.Int("check-interval"))
 
 		<-ctx.Done()
@@ -420,14 +433,14 @@ func (w *limitWriter) Write(p []byte) (n int, err error) {
 	pLen := len(p)
 
 	if bufLen+pLen <= w.size {
-		return w.Write(p)
+		return w.buf.Write(p)
 	}
 
 	if w.size <= bufLen {
 		return pLen, nil
 	}
 
-	_, err = w.Write(p[:w.size-bufLen])
+	_, err = w.buf.Write(p[:w.size-bufLen])
 	return pLen, err
 }
 
@@ -437,8 +450,8 @@ func (w *limitWriter) Bytes() []byte {
 
 func runSyncCommand(ctx context.Context, command string, srcPath, destPath string) {
 	cmd := exec.CommandContext(ctx, command, srcPath, destPath)
-	stdoutWriter := newLimitWriter(20 * 1024)
-	stderrWriter := newLimitWriter(20 * 1024)
+	stdoutWriter := newLimitWriter(maxOutputLen)
+	stderrWriter := newLimitWriter(maxOutputLen)
 	cmd.Stdout = stdoutWriter
 	cmd.Stderr = stderrWriter
 
@@ -511,6 +524,12 @@ func poll(ctx context.Context, invalidate func(), cfg *config, interval int) {
 			}
 		}
 	}()
+}
+
+func createTestInvalidator() func() {
+	return func() {
+		log.Info("invalidated")
+	}
 }
 
 func createInvalidator(socket, phpFile string) func() {
