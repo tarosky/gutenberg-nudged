@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -18,6 +21,7 @@ import (
 	"github.com/yookoala/gofast"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -153,6 +157,114 @@ func setPIDFile(path string) func() {
 	}
 }
 
+type DirSync struct {
+	SrcDir                  string `json:"source-directory"`
+	DestDir                 string `json:"destination-directory"`
+	File                    string `json:"file"`
+	WithAdditionFile        string `json:"with-addition-file"`
+	FileModTime             time.Time
+	WithAdditionFileModTime time.Time
+}
+
+func (s *DirSync) poll() *bool {
+	additionT := fileModTime(s.WithAdditionFile)
+	if additionT != nil && !additionT.Equal(s.WithAdditionFileModTime) {
+		b := true
+		return &b
+	}
+
+	t := fileModTime(s.File)
+	if t != nil && !t.Equal(s.FileModTime) {
+		b := false
+		return &b
+	}
+
+	return nil
+}
+
+func mustGetAbsPath(path string) string {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to get %s: %s", path, err.Error())
+		panic(err)
+	}
+	return path
+}
+
+type DirsNotification struct {
+	DirSyncs    []*DirSync `json:"directory-synchronizations"`
+	SyncCommand string     `json:"sync-command"`
+}
+
+func (n *DirsNotification) poll() ([]*DirSync, bool) {
+	ds := []*DirSync{}
+	addition := false
+	for _, d := range n.DirSyncs {
+		status := d.poll()
+		if status == nil {
+			continue
+		}
+
+		addition = addition || *status
+		ds = append(ds, d)
+	}
+
+	return ds, addition
+}
+
+type Notifications struct {
+	File        string            `json:"file"`
+	Dirs        *DirsNotification `json:"directories"`
+	FileModTime time.Time
+}
+
+func (n *Notifications) poll() ([]*DirSync, bool) {
+	ds, addition := n.poll()
+
+	t := fileModTime(n.File)
+	if t != nil && !t.Equal(n.FileModTime) {
+		addition = true
+	}
+
+	return ds, addition
+}
+
+type config struct {
+	Notifications *Notifications `json:"notifications"`
+}
+
+func loadConfig(log *zap.Logger, path string) *config {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Panic("failed to open config file", zap.Error(err))
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			log.Error("failed to close config file", zap.Error(err))
+		}
+	}()
+
+	data, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Error("failed to read config file", zap.Error(err))
+	}
+
+	cfg := &config{}
+	if err := json.Unmarshal(data, cfg); err != nil {
+		log.Panic("Illegal config file", zap.Error(err))
+	}
+
+	for _, dirSync := range cfg.Notifications.Dirs.DirSyncs {
+		dirSync.SrcDir = mustGetAbsPath(dirSync.SrcDir)
+		dirSync.DestDir = mustGetAbsPath(dirSync.DestDir)
+		dirSync.File = mustGetAbsPath(dirSync.File)
+		dirSync.WithAdditionFile = mustGetAbsPath(dirSync.WithAdditionFile)
+	}
+	cfg.Notifications.File = mustGetAbsPath(cfg.Notifications.File)
+
+	return cfg
+}
+
 func main() {
 	app := cli.NewApp()
 	app.Name = "nudged"
@@ -160,16 +272,10 @@ func main() {
 
 	app.Flags = []cli.Flag{
 		&cli.PathFlag{
-			Name:     "nudge-file",
-			Aliases:  []string{"f"},
+			Name:     "config-file",
+			Aliases:  []string{"c"},
 			Required: true,
-			Usage:    "File to nudge when change happens.",
-		},
-		&cli.StringFlag{
-			Name:    "nudge-type",
-			Aliases: []string{"t"},
-			Value:   "mtime",
-			Usage:   "The way gutenberg-nudge nudges using the file. Currently the only supported value is mtime.",
+			Usage:    "Configuration file path.",
 		},
 		&cli.IntFlag{
 			Name:    "check-interval",
@@ -221,10 +327,6 @@ func main() {
 			mustGetAbsPath("error-log-path"))
 		defer log.Sync()
 
-		if nudgeType := c.String("nudge-type"); nudgeType != "mtime" {
-			log.Panic("illegal nudge-type parameter", zap.String("parameter", nudgeType))
-		}
-
 		removePIDFile := setPIDFile(mustGetAbsPath("pid-file"))
 		defer removePIDFile()
 
@@ -242,9 +344,11 @@ func main() {
 			cancel()
 		}()
 
+		cfg := loadConfig(log, mustGetAbsPath("config-file"))
+
 		invalidator := createInvalidator(
 			mustGetAbsPath("fastcgi-socket"), mustGetAbsPath("invalidator-file"))
-		poll(ctx, invalidator, mustGetAbsPath("nudge-file"), c.Int("check-interval"))
+		poll(ctx, invalidator, cfg, c.Int("check-interval"))
 
 		<-ctx.Done()
 
@@ -275,7 +379,7 @@ func (w *ResWriter) WriteHeader(statusCode int) {
 	log.Debug("php response", zap.Int("status code", statusCode))
 }
 
-func fileInfo(path string) os.FileInfo {
+func fileModTime(path string) *time.Time {
 	// Ignore NFS cache by opening file before stat().
 	f, err := os.Open(path)
 	if err != nil {
@@ -294,12 +398,94 @@ func fileInfo(path string) os.FileInfo {
 		return nil
 	}
 
-	return st
+	time := st.ModTime()
+
+	return &time
 }
 
-func poll(ctx context.Context, invalidate func(), file string, interval int) {
+type limitWriter struct {
+	buf  *bytes.Buffer
+	size int
+}
+
+func newLimitWriter(size int) *limitWriter {
+	return &limitWriter{
+		buf:  &bytes.Buffer{},
+		size: size,
+	}
+}
+
+func (w *limitWriter) Write(p []byte) (n int, err error) {
+	bufLen := w.buf.Len()
+	pLen := len(p)
+
+	if bufLen+pLen <= w.size {
+		return w.Write(p)
+	}
+
+	if w.size <= bufLen {
+		return pLen, nil
+	}
+
+	_, err = w.Write(p[:w.size-bufLen])
+	return pLen, err
+}
+
+func (w *limitWriter) Bytes() []byte {
+	return w.buf.Bytes()
+}
+
+func runSyncCommand(ctx context.Context, command string, srcPath, destPath string) {
+	cmd := exec.CommandContext(ctx, command, srcPath, destPath)
+	stdoutWriter := newLimitWriter(20 * 1024)
+	stderrWriter := newLimitWriter(20 * 1024)
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
+
+	log.Debug("sync command starting", zap.String("src", srcPath), zap.String("dest", destPath))
+
+	exitCode := 0
+	if err := cmd.Run(); err != nil {
+		if err2, ok := err.(*exec.ExitError); ok {
+			exitCode = err2.ExitCode()
+		} else {
+			log.Error("failed to run sync command",
+				zap.Error(err), zap.String("src", srcPath), zap.String("dest", destPath))
+			return
+		}
+	}
+
+	var logEntry func(msg string, fields ...zap.Field)
+	if exitCode == 0 {
+		logEntry = log.Debug
+	} else {
+		logEntry = log.Error
+	}
+
+	logEntry("sync command executed",
+		zap.Int("status", exitCode),
+		zap.String("src", srcPath),
+		zap.String("dest", destPath),
+		zap.ByteString("stdout", stdoutWriter.Bytes()),
+		zap.ByteString("stderr", stderrWriter.Bytes()))
+}
+
+func runSync(ctx context.Context, command string, ds []*DirSync) {
+	eg := &errgroup.Group{}
+	for _, d := range ds {
+		d := d
+		eg.Go(func() error {
+			runSyncCommand(ctx, command, d.SrcDir, d.DestDir)
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		panic("should not happen")
+	}
+}
+
+func poll(ctx context.Context, invalidate func(), cfg *config, interval int) {
 	go func() {
-		mtime := time.Time{}
 		pace := time.Duration(interval) * time.Millisecond
 		pacemaker := time.NewTicker(pace)
 
@@ -310,19 +496,18 @@ func poll(ctx context.Context, invalidate func(), file string, interval int) {
 				break
 
 			case <-pacemaker.C:
-				st := fileInfo(file)
-				if st == nil {
-					continue
-				}
+				ds, addition := cfg.Notifications.poll()
 
-				t := st.ModTime()
-				if mtime.Equal(t) {
-					continue
+				for _, d := range ds {
+					log.Debug(
+						"dir sync nudged", zap.String("src", d.SrcDir), zap.String("dest", d.DestDir))
 				}
+				runSync(ctx, cfg.Notifications.Dirs.SyncCommand, ds)
 
-				mtime = t
-				log.Debug("nudged", zap.Time("mtime", mtime))
-				invalidate()
+				if addition {
+					log.Debug("addition nudged")
+					invalidate()
+				}
 			}
 		}
 	}()
