@@ -1,6 +1,6 @@
 module github.com/tarosky/gutenberg-nudged
 
-go 1.15
+go 1.16
 
 require (
 	github.com/urfave/cli/v2 v2.2.0

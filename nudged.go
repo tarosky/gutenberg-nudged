@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -117,14 +118,14 @@ func createLogger(ctx context.Context, logPath, errorLogPath string) *zap.Logger
 			select {
 			case _, ok := <-sigusr1:
 				if !ok {
-					break
+					return
 				}
 				out.reopen()
 				errOut.reopen()
 			case <-ctx.Done():
 				signal.Stop(sigusr1)
 				// closing sigusr1 causes panic (close of closed channel)
-				break
+				return
 			}
 		}
 	}()
@@ -345,7 +346,7 @@ func main() {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		sig := make(chan os.Signal)
-		signal.Notify(sig, os.Interrupt, os.Kill, syscall.SIGTERM, syscall.SIGQUIT)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 		go func() {
 			defer func() {
 				signal.Stop(sig)
@@ -358,9 +359,10 @@ func main() {
 
 		cfg := loadConfig(log, mustGetAbsPath("config-file"))
 
-		invalidator := createInvalidator(
+		invalidator := CreateInvalidator(
 			mustGetAbsPath("fastcgi-socket"), cfg.Notifications.InvalidatorFile)
-		// invalidator := createTestInvalidator()
+		// invalidator := CreateTestInvalidator()
+
 		poll(ctx, invalidator, cfg, c.Int("check-interval"))
 
 		<-ctx.Done()
@@ -375,7 +377,9 @@ func main() {
 }
 
 // ResWriter is a simple implementation of http.ResponseWriter.
-type ResWriter struct{}
+type ResWriter struct {
+	statusCode int
+}
 
 // Header is.
 func (w *ResWriter) Header() http.Header {
@@ -389,7 +393,7 @@ func (w *ResWriter) Write(bs []byte) (int, error) {
 
 // WriteHeader is.
 func (w *ResWriter) WriteHeader(statusCode int) {
-	log.Debug("php response", zap.Int("status code", statusCode))
+	w.statusCode = statusCode
 }
 
 func fileModTime(path string) *time.Time {
@@ -497,16 +501,17 @@ func runSync(ctx context.Context, command string, ds []*DirSync) {
 	}
 }
 
-func poll(ctx context.Context, invalidate func(), cfg *config, interval int) {
+func poll(ctx context.Context, invalidate func() bool, cfg *config, interval int) {
 	go func() {
 		pace := time.Duration(interval) * time.Millisecond
 		pacemaker := time.NewTicker(pace)
+		succeeded := true
 
 		for {
 			select {
 			case <-ctx.Done():
 				pacemaker.Stop()
-				break
+				return
 
 			case <-pacemaker.C:
 				ds, addition := cfg.Notifications.poll()
@@ -517,29 +522,43 @@ func poll(ctx context.Context, invalidate func(), cfg *config, interval int) {
 				}
 				runSync(ctx, cfg.Notifications.Dirs.SyncCommand, ds)
 
-				if addition {
-					log.Debug("addition nudged")
-					invalidate()
+				if addition || !succeeded {
+					if addition {
+						log.Debug("addition nudged")
+					}
+
+					if !succeeded {
+						log.Debug("addition retried")
+					}
+
+					succeeded = invalidate()
 				}
 			}
 		}
 	}()
 }
 
-func createTestInvalidator() func() {
-	return func() {
-		log.Info("invalidated")
+// CreateTestInvalidator creates test invalidator.
+func CreateTestInvalidator() func() bool {
+	return func() bool {
+		if rand.Intn(100) < 60 {
+			log.Info("invalidated")
+			return true
+		}
+		log.Info("failed to invalidate")
+		return false
 	}
 }
 
-func createInvalidator(socket, phpFile string) func() {
-	return func() {
+// CreateInvalidator creates invalidator.
+func CreateInvalidator(socket, phpFile string) func() bool {
+	return func() bool {
 		connFactory := gofast.SimpleConnFactory("unix", socket)
 
 		client, err := gofast.SimpleClientFactory(connFactory, 0)()
 		if err != nil {
 			log.Error("client", zap.Error(err))
-			return
+			return false
 		}
 		defer client.Close()
 
@@ -568,8 +587,12 @@ func createInvalidator(socket, phpFile string) func() {
 		})
 		if err != nil {
 			log.Error("fastcgi failure", zap.Error(err))
-			return
+			return false
 		}
-		resp.WriteTo(&ResWriter{}, os.Stderr)
+
+		rw := &ResWriter{}
+		resp.WriteTo(rw, os.Stderr)
+		log.Debug("php response", zap.Int("status code", rw.statusCode))
+		return 200 <= rw.statusCode && rw.statusCode < 300
 	}
 }
